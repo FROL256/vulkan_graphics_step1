@@ -41,25 +41,6 @@ namespace vk_utils
   VkDevice CreateLogicalDevice(uint32_t queueFamilyIndex, VkPhysicalDevice physicalDevice, const std::vector<const char *>& a_enabledLayers, std::vector<const char *> a_extentions = std::vector<const char *>());
   uint32_t FindMemoryType(uint32_t memoryTypeBits, VkMemoryPropertyFlags properties, VkPhysicalDevice physicalDevice);
 
-  //// FrameBuffer and SwapChain issues
-  //
-  struct ScreenBufferResources
-  {
-    VkSwapchainKHR             swapChain;
-    std::vector<VkImage>       swapChainImages;
-    VkFormat                   swapChainImageFormat;
-    VkExtent2D                 swapChainExtent;
-    std::vector<VkImageView>   swapChainImageViews;
-    std::vector<VkFramebuffer> swapChainFramebuffers;
-  };
-
-  void CreateCwapChain(VkPhysicalDevice a_physDevice, VkDevice a_device, VkSurfaceKHR a_surface, int a_width, int a_height,
-                       ScreenBufferResources* a_buff);
-
-  void CreateScreenImageViews(VkDevice a_device, ScreenBufferResources* pScreen);
-
-  void CreateScreenFrameBuffers(VkDevice a_device, VkRenderPass a_renderPass, ScreenBufferResources* pScreen);
-
   std::vector<uint32_t> ReadFile(const char* filename);
   VkShaderModule CreateShaderModule(VkDevice a_device, const std::vector<uint32_t>& code);
 };
