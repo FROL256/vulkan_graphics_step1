@@ -18,6 +18,7 @@
 #include <cassert>
 
 #include "vk_utils.h"
+#include "Bitmap.h"
 
 const int WIDTH  = 800;
 const int HEIGHT = 600;
@@ -33,6 +34,8 @@ const bool enableValidationLayers = false;
 #else
 const bool enableValidationLayers = true;
 #endif
+
+const VkFormat FRAMEBUFFER_FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 
 class HelloTriangleApplication 
 {
@@ -60,6 +63,7 @@ private:
 
   VkQueue graphicsQueue;
   VkQueue presentQueue;
+  VkQueue transferQueue;
 
   vk_utils::ScreenBufferResources screen;
 
@@ -70,7 +74,7 @@ private:
   VkPipelineLayout pipelineLayout;
   VkPipeline       graphicsPipeline;
 
-  VkCommandPool                commandPool;
+  VkCommandPool                commandPool, commandPoolTransfer;
   std::vector<VkCommandBuffer> commandBuffers;
 
   VkBuffer       m_vbo;     // we will store our vertices data here 
@@ -141,6 +145,7 @@ private:
   
     physicalDevice = vk_utils::FindPhysicalDevice(instance, true, deviceId);
     auto queueFID  = vk_utils::GetQueueFamilyIndex(physicalDevice, VK_QUEUE_GRAPHICS_BIT);
+    auto queueTID  = vk_utils::GetQueueFamilyIndex(physicalDevice, VK_QUEUE_TRANSFER_BIT);
 
     VkBool32 presentSupport = false;
     vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFID, surface, &presentSupport);
@@ -150,7 +155,23 @@ private:
     device = vk_utils::CreateLogicalDevice(queueFID, physicalDevice, enabledLayers, deviceExtensions);
     vkGetDeviceQueue(device, queueFID, 0, &graphicsQueue);
     vkGetDeviceQueue(device, queueFID, 0, &presentQueue);
+    vkGetDeviceQueue(device, queueTID, 0, &transferQueue);
     
+    // ==> commandPools
+    {
+      VkCommandPoolCreateInfo poolInfo = {};
+      poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+      poolInfo.queueFamilyIndex = vk_utils::GetQueueFamilyIndex(physicalDevice, VK_QUEUE_GRAPHICS_BIT);
+
+      if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
+        throw std::runtime_error("[CreateCommandPool]: failed to create graphics command pool!");
+
+      poolInfo.queueFamilyIndex = vk_utils::GetQueueFamilyIndex(physicalDevice, VK_QUEUE_TRANSFER_BIT);
+      if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPoolTransfer) != VK_SUCCESS)
+        throw std::runtime_error("[CreateCommandPool]: failed to create transfer command pool!");
+    }
+
+
     vk_utils::CreateCwapChain(physicalDevice, device, surface, WIDTH, HEIGHT,
                               &screen);
 
@@ -167,7 +188,7 @@ private:
 
     //// create resources for offscreen rendering
     {
-      CreateRenderPass(device, VK_FORMAT_R8G8B8A8_UNORM,
+      CreateRenderPass(device, FRAMEBUFFER_FORMAT,
                        &renderPassOffscreen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
       CreateTextureForRenderToIt(device, physicalDevice, WIDTH, HEIGHT,
@@ -186,8 +207,9 @@ private:
   
     CreateScreenFrameBuffers(device, renderPass, &screen);
     
-    CreateCommandPoolAndBuffers(device, physicalDevice, screen.swapChainFramebuffers, screen.swapChainExtent, renderPass, graphicsPipeline, m_vbo,
-                                &commandPool, &commandBuffers);
+  
+    CreateAndWriteCmdBuffers(device, screen.swapChainFramebuffers, screen.swapChainExtent, renderPass, graphicsPipeline, m_vbo, commandPool,
+                             &commandBuffers);
 
     CreateSyncObjects(device, &m_sync);
 
@@ -205,6 +227,23 @@ private:
     PutTriangleVerticesToVBO_Now(device, commandPool, graphicsQueue, trianglePos, 6*2,
                                  m_vbo);
 
+    RenderToTexture_Now(device, commandPool, graphicsQueue, graphicsPipeline, m_vbo,
+                        offFrameBufferObj, VkExtent2D{ WIDTH, HEIGHT }, renderPassOffscreen);
+
+    CopyTextureToBuffer_Now(device, commandPoolTransfer, transferQueue, offImage, WIDTH, HEIGHT,
+                            stagingBuff);
+
+    // Get data from stagingBuff to imageData
+    //
+    std::vector<uint32_t> imageData(WIDTH*HEIGHT);
+    {
+      void *mappedMemory = nullptr;
+      vkMapMemory(device, stagingBuffMem, 0, WIDTH * HEIGHT * sizeof(int), 0, &mappedMemory);
+      memcpy(imageData.data(), mappedMemory, WIDTH * HEIGHT * sizeof(int));
+      vkUnmapMemory(device, stagingBuffMem);  // Done reading, so unmap.
+    }
+
+    SaveBMP("outimage.bmp", imageData.data(), WIDTH, HEIGHT);
   }
 
   void mainLoop()
@@ -252,6 +291,7 @@ private:
     }
 
     vkDestroyCommandPool(device, commandPool, nullptr);
+    vkDestroyCommandPool(device, commandPoolTransfer, nullptr);
 
     for (auto framebuffer : screen.swapChainFramebuffers) {
       vkDestroyFramebuffer(device, framebuffer, nullptr);
@@ -448,24 +488,17 @@ private:
   }
 
 
-  static void CreateCommandPoolAndBuffers(VkDevice a_device, VkPhysicalDevice a_physDevice, std::vector<VkFramebuffer> a_swapChainFramebuffers, VkExtent2D a_frameBufferExtent, 
-                                          VkRenderPass a_renderPass, VkPipeline a_graphicsPipeline, VkBuffer a_vPosBuffer,
-                                          VkCommandPool* a_cmdPool, std::vector<VkCommandBuffer>* a_cmdBuffers) 
+  static void CreateAndWriteCmdBuffers(VkDevice a_device, std::vector<VkFramebuffer> a_swapChainFramebuffers, VkExtent2D a_frameBufferExtent, 
+                                       VkRenderPass a_renderPass, VkPipeline a_graphicsPipeline, VkBuffer a_vPosBuffer, VkCommandPool a_cmdPool,
+                                       std::vector<VkCommandBuffer>* a_cmdBuffers) 
   {
     std::vector<VkCommandBuffer>& commandBuffers = (*a_cmdBuffers);
-
-    VkCommandPoolCreateInfo poolInfo = {};
-    poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = vk_utils::GetQueueFamilyIndex(a_physDevice, VK_QUEUE_GRAPHICS_BIT);
-
-    if (vkCreateCommandPool(a_device, &poolInfo, nullptr, a_cmdPool) != VK_SUCCESS)
-      throw std::runtime_error("[CreateCommandPoolAndBuffers]: failed to create command pool!");
 
     commandBuffers.resize(a_swapChainFramebuffers.size());
 
     VkCommandBufferAllocateInfo allocInfo = {};
     allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool        = (*a_cmdPool);
+    allocInfo.commandPool        = a_cmdPool;
     allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
 
@@ -511,6 +544,103 @@ private:
       }
     }
   }
+
+  static void RenderToTexture_Now(VkDevice a_device, VkCommandPool a_cmdPool, VkQueue a_queue, VkPipeline a_graphicsPipeline, VkBuffer a_vPosBuffer,
+                                  VkFramebuffer a_fbo, VkExtent2D a_frameBufferExtent, VkRenderPass a_renderPass)
+  {
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool        = a_cmdPool;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmdBuff;
+    if (vkAllocateCommandBuffers(a_device, &allocInfo, &cmdBuff) != VK_SUCCESS)
+      throw std::runtime_error("[RenderToTexture_Now]: failed to allocate command buffer!");
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmdBuff, &beginInfo);
+    {
+      VkRenderPassBeginInfo renderPassInfo = {};
+      renderPassInfo.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+      renderPassInfo.renderPass        = a_renderPass;
+      renderPassInfo.framebuffer       = a_fbo;
+      renderPassInfo.renderArea.offset = { 0, 0 };
+      renderPassInfo.renderArea.extent = a_frameBufferExtent;
+
+      VkClearValue clearColor        = { 0.0f, 0.0f, 0.25f, 1.0f };
+      renderPassInfo.clearValueCount = 1;
+      renderPassInfo.pClearValues    = &clearColor;
+
+      vkCmdBeginRenderPass(cmdBuff, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+      {
+        vkCmdBindPipeline(cmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, a_graphicsPipeline);
+
+        // say we want to take vertices pos from a_vPosBuffer
+        {
+          VkBuffer vertexBuffers[] = { a_vPosBuffer };
+          VkDeviceSize offsets[] = { 0 };
+          vkCmdBindVertexBuffers(cmdBuff, 0, 1, vertexBuffers, offsets);
+        }
+
+        vkCmdDraw(cmdBuff, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(cmdBuff);
+      }
+    }
+    vkEndCommandBuffer(cmdBuff);
+
+    RunCommandBuffer(cmdBuff, a_queue, a_device);
+
+    vkFreeCommandBuffers(a_device, a_cmdPool, 1, &cmdBuff);
+  }
+
+
+  void CopyTextureToBuffer_Now(VkDevice a_device, VkCommandPool a_cmdPool, VkQueue a_queue, VkImage a_image, int a_width, int a_height,
+                               VkBuffer out_buffer)
+  {
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool        = a_cmdPool;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmdBuff;
+    if (vkAllocateCommandBuffers(a_device, &allocInfo, &cmdBuff) != VK_SUCCESS)
+      throw std::runtime_error("[RenderToTexture_Now]: failed to allocate command buffer!");
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmdBuff, &beginInfo);
+    {
+      VkImageSubresourceLayers shittylayers = {};
+      shittylayers.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      shittylayers.mipLevel       = 0;
+      shittylayers.baseArrayLayer = 0;
+      shittylayers.layerCount     = 1;
+
+      VkBufferImageCopy wholeRegion = {};
+      wholeRegion.bufferOffset      = 0;
+      wholeRegion.bufferRowLength   = uint32_t(a_width);
+      wholeRegion.bufferImageHeight = uint32_t(a_height);
+      wholeRegion.imageExtent       = VkExtent3D{ uint32_t(a_width), uint32_t(a_height), 1 };
+      wholeRegion.imageOffset       = VkOffset3D{ 0,0,0 };
+      wholeRegion.imageSubresource  = shittylayers;
+
+      vkCmdCopyImageToBuffer(cmdBuff, a_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out_buffer, 1, &wholeRegion);
+    }
+    vkEndCommandBuffer(cmdBuff);
+
+    RunCommandBuffer(cmdBuff, a_queue, a_device);
+
+    vkFreeCommandBuffers(a_device, a_cmdPool, 1, &cmdBuff);
+  }
+
 
   static void CreateSyncObjects(VkDevice a_device, SyncObj* a_pSyncObjs)
   {
@@ -597,7 +727,7 @@ private:
     imgCreateInfo.pNext         = nullptr;
     imgCreateInfo.flags         = 0; 
     imgCreateInfo.imageType     = VK_IMAGE_TYPE_2D;
-    imgCreateInfo.format        = VK_FORMAT_R8G8B8A8_UNORM;
+    imgCreateInfo.format        = FRAMEBUFFER_FORMAT;
     imgCreateInfo.extent        = VkExtent3D{ uint32_t(a_width), uint32_t(a_height), 1 };
     imgCreateInfo.mipLevels     = 1;
     imgCreateInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
@@ -627,7 +757,7 @@ private:
       imageViewInfo.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
       imageViewInfo.flags      = 0;
       imageViewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
-      imageViewInfo.format     = VK_FORMAT_R8G8B8A8_UNORM;
+      imageViewInfo.format     = FRAMEBUFFER_FORMAT;
       imageViewInfo.components = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
       imageViewInfo.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
       imageViewInfo.subresourceRange.baseMipLevel   = 0;
