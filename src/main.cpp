@@ -63,6 +63,9 @@ private:
 
   vk_utils::ScreenBufferResources screen;
 
+  VkRenderPass     renderPassOffscreen;
+  VkFramebuffer    offFrameBufferObj;
+
   VkRenderPass     renderPass;
   VkPipelineLayout pipelineLayout;
   VkPipeline       graphicsPipeline;
@@ -70,8 +73,17 @@ private:
   VkCommandPool                commandPool;
   std::vector<VkCommandBuffer> commandBuffers;
 
-  VkBuffer       m_vbo;     //  
-  VkDeviceMemory m_vboMem;  // we will store our vertices data here
+  VkBuffer       m_vbo;     // we will store our vertices data here 
+  VkDeviceMemory m_vboMem;  // 
+
+  // offscreen rendering resources
+  //
+  VkImage         offImage;      // we will render to this image 
+  VkDeviceMemory  offImageMem;   //
+  VkImageView     offImageView;  // 
+
+  VkBuffer        stagingBuff;   // we will copy rendered image to this bufer to we can read from it and save bmp further
+  VkDeviceMemory  stagingBuffMem;
 
   struct SyncObj
   {
@@ -153,6 +165,22 @@ private:
     CreateRenderPass(device, screen.swapChainImageFormat, 
                      &renderPass);
 
+    //// create resources for offscreen rendering
+    {
+      CreateRenderPass(device, VK_FORMAT_R8G8B8A8_UNORM,
+                       &renderPassOffscreen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+      CreateTextureForRenderToIt(device, physicalDevice, WIDTH, HEIGHT,
+                                 &offImage, &offImageMem, &offImageView);
+
+      CreateFBO(device, renderPassOffscreen, offImageView, WIDTH, HEIGHT,
+                &offFrameBufferObj);
+
+      CreateStagingBuffer(device, physicalDevice, WIDTH*HEIGHT * sizeof(int),
+                          &stagingBuff, &stagingBuffMem);
+    }
+    ///// \\\\ 
+
     CreateGraphicsPipeline(device, screen.swapChainExtent, renderPass, 
                            &pipelineLayout, &graphicsPipeline);
   
@@ -193,8 +221,19 @@ private:
   void cleanup() 
   { 
     // free our vbo
-    vkFreeMemory(device, m_vboMem, NULL);
-    vkDestroyBuffer(device, m_vbo, NULL);
+    vkDestroyBuffer(device, m_vbo, nullptr);
+    vkFreeMemory(device, m_vboMem, nullptr);
+
+    // destroy intermediate i. e. "staging" buffer
+    vkDestroyBuffer(device, stagingBuff, nullptr);
+    vkFreeMemory(device, stagingBuffMem, nullptr);
+
+    // free our offscreen resources
+    vkDestroyImageView(device, offImageView, nullptr);
+    vkDestroyImage    (device, offImage, nullptr);
+    vkFreeMemory      (device, offImageMem, nullptr);
+    vkDestroyFramebuffer(device, offFrameBufferObj, nullptr);
+    vkDestroyRenderPass (device, renderPassOffscreen, nullptr);
 
     if (enableValidationLayers)
     {
@@ -221,6 +260,7 @@ private:
     vkDestroyPipeline      (device, graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     vkDestroyRenderPass    (device, renderPass, nullptr);
+   
 
     for (auto imageView : screen.swapChainImageViews) {
       vkDestroyImageView(device, imageView, nullptr);
@@ -237,18 +277,18 @@ private:
     glfwTerminate();
   }
 
-  static void CreateRenderPass(VkDevice a_device, VkFormat a_swapChainImageFormat,
-                               VkRenderPass* a_pRenderPass)
+  static void CreateRenderPass(VkDevice a_device, VkFormat a_imageFormat,
+                               VkRenderPass* a_pRenderPass, VkImageLayout a_finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
   {
     VkAttachmentDescription colorAttachment = {};
-    colorAttachment.format         = a_swapChainImageFormat;
+    colorAttachment.format         = a_imageFormat;
     colorAttachment.samples        = VK_SAMPLE_COUNT_1_BIT;
     colorAttachment.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachment.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachment.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAttachment.finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    colorAttachment.finalLayout    = a_finalLayout;
 
     VkAttachmentReference colorAttachmentRef = {};
     colorAttachmentRef.attachment = 0;
@@ -279,6 +319,7 @@ private:
     if (vkCreateRenderPass(a_device, &renderPassInfo, nullptr, a_pRenderPass) != VK_SUCCESS)
       throw std::runtime_error("[CreateRenderPass]: failed to create render pass!");
   }
+
 
   static void CreateGraphicsPipeline(VkDevice a_device, VkExtent2D a_screenExtent, VkRenderPass a_renderPass,
                                      VkPipelineLayout* a_pLayout, VkPipeline* a_pPipiline)
@@ -519,8 +560,101 @@ private:
     allocateInfo.memoryTypeIndex = vk_utils::FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, a_physDevice); // #NOTE VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 
     VK_CHECK_RESULT(vkAllocateMemory(a_device, &allocateInfo, NULL, a_pBufferMemory));   // allocate memory on device.
-
     VK_CHECK_RESULT(vkBindBufferMemory(a_device, (*a_pBuffer), (*a_pBufferMemory), 0));  // Now associate that allocated memory with the bufferStaging. With that, the bufferStaging is backed by actual memory.
+  }
+
+  static void CreateStagingBuffer(VkDevice a_device, VkPhysicalDevice a_physDevice, const size_t a_bufferSize,
+                                  VkBuffer *a_pBuffer, VkDeviceMemory *a_pBufferMemory)
+  {
+    VkBufferCreateInfo bufferCreateInfo = {};
+    bufferCreateInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferCreateInfo.size        = a_bufferSize; // bufferStaging size in bytes.
+    bufferCreateInfo.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT; // bufferStaging is used as a storage bufferStaging and we can _copy_to_ it. #NOTE this!
+    bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE; // bufferStaging is exclusive to a single queue family at a time.
+
+    VK_CHECK_RESULT(vkCreateBuffer(a_device, &bufferCreateInfo, NULL, a_pBuffer)); // create bufferStaging.
+
+    VkMemoryRequirements memoryRequirements;
+    vkGetBufferMemoryRequirements(a_device, (*a_pBuffer), &memoryRequirements);
+
+  
+    VkMemoryAllocateInfo allocateInfo = {};
+    allocateInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocateInfo.allocationSize  = memoryRequirements.size; // specify required memory.
+    allocateInfo.memoryTypeIndex = vk_utils::FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, a_physDevice);
+
+    VK_CHECK_RESULT(vkAllocateMemory(a_device, &allocateInfo, NULL, a_pBufferMemory));  // allocate memory on device.                                                                                       
+    VK_CHECK_RESULT(vkBindBufferMemory(a_device, (*a_pBuffer), (*a_pBufferMemory), 0)); // Now associate that allocated memory with the bufferStaging. With that, the bufferStaging is backed by actual memory.
+  }
+
+  static void CreateTextureForRenderToIt(VkDevice a_device, VkPhysicalDevice a_physDevice, const int a_width, const int a_height,
+                                         VkImage *a_image, VkDeviceMemory *a_pImagesMemory, VkImageView* a_attachmentView)
+  {
+    // first create desired objects, but still don't allocate memory for them
+    //
+    VkImageCreateInfo imgCreateInfo = {};
+    imgCreateInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgCreateInfo.pNext         = nullptr;
+    imgCreateInfo.flags         = 0; 
+    imgCreateInfo.imageType     = VK_IMAGE_TYPE_2D;
+    imgCreateInfo.format        = VK_FORMAT_R8G8B8A8_UNORM;
+    imgCreateInfo.extent        = VkExtent3D{ uint32_t(a_width), uint32_t(a_height), 1 };
+    imgCreateInfo.mipLevels     = 1;
+    imgCreateInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imgCreateInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imgCreateInfo.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; // copy from the texture and render to it
+    imgCreateInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    imgCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imgCreateInfo.arrayLayers   = 1;
+    VK_CHECK_RESULT(vkCreateImage(a_device, &imgCreateInfo, nullptr, a_image));
+
+    // now allocate memory for image
+    //
+    VkMemoryRequirements memoryRequirements;
+    vkGetImageMemoryRequirements(a_device, *a_image, &memoryRequirements);
+
+    VkMemoryAllocateInfo allocateInfo = {};
+    allocateInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocateInfo.allocationSize  = memoryRequirements.size; // specify required memory.
+    allocateInfo.memoryTypeIndex = vk_utils::FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, a_physDevice);
+    VK_CHECK_RESULT(vkAllocateMemory(a_device, &allocateInfo, NULL, a_pImagesMemory)); // allocate memory on device.
+    VK_CHECK_RESULT(vkBindImageMemory(a_device, (*a_image), (*a_pImagesMemory), 0));
+
+    // and create image view finally
+    //
+    VkImageViewCreateInfo imageViewInfo = {};
+    {
+      imageViewInfo.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+      imageViewInfo.flags      = 0;
+      imageViewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+      imageViewInfo.format     = VK_FORMAT_R8G8B8A8_UNORM;
+      imageViewInfo.components = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
+      imageViewInfo.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      imageViewInfo.subresourceRange.baseMipLevel   = 0;
+      imageViewInfo.subresourceRange.baseArrayLayer = 0;
+      imageViewInfo.subresourceRange.layerCount     = 1;
+      imageViewInfo.subresourceRange.levelCount     = 1;
+      imageViewInfo.image                           = (*a_image);
+    }
+    VK_CHECK_RESULT(vkCreateImageView(a_device, &imageViewInfo, nullptr, a_attachmentView));
+
+  }
+
+  static void CreateFBO(VkDevice a_device, VkRenderPass a_renderPass, VkImageView a_view, int a_width, int a_heiht,
+                        VkFramebuffer* a_fbo)
+  {
+   
+    VkFramebufferCreateInfo framebufferInfo = {};
+    framebufferInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebufferInfo.renderPass      = a_renderPass;
+    framebufferInfo.attachmentCount = 1;
+    framebufferInfo.pAttachments    = &a_view;
+    framebufferInfo.width           = a_width;
+    framebufferInfo.height          = a_heiht;
+    framebufferInfo.layers          = 1;
+
+    if (vkCreateFramebuffer(a_device, &framebufferInfo, nullptr, a_fbo) != VK_SUCCESS)
+      throw std::runtime_error("[CreateFBO]: failed to create framebuffer!");
   }
 
   static void RunCommandBuffer(VkCommandBuffer a_cmdBuff, VkQueue a_queue, VkDevice a_device)
