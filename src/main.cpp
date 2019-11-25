@@ -131,7 +131,7 @@ private:
   {
     std::cout << "[InitResources]: begin ... " << std::endl;
 
-    CreateVertexBuffer(device, physicalDevice, 6*sizeof(float),
+    CreateVertexBuffer(device, physicalDevice, 6*2*sizeof(float),
                        &m_vbo, &m_vboMem);
 
     //// create resources for offscreen rendering
